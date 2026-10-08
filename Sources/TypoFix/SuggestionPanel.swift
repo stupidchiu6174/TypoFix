@@ -1,12 +1,15 @@
 import AppKit
 
-/// Small floating bubble near the caret. Never takes focus or mouse input.
+/// Small floating bubble near the caret. Clicking it applies the fix; it never takes focus,
+/// so the caret stays in the app being typed in.
 final class SuggestionPanel {
     private let panel: NSPanel
     private let label = NSTextField(labelWithString: "")
-    private let hint = NSTextField(labelWithString: "Tab 接受　Esc 略過")
+    private let hint = NSTextField(labelWithString: "點一下或 Tab 套用　Esc 略過")
 
     var isVisible: Bool { panel.isVisible }
+    /// Called when the bubble is clicked.
+    var onClick: () -> Void = {}
 
     init() {
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 200, height: 50),
@@ -16,11 +19,13 @@ final class SuggestionPanel {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.ignoresMouseEvents = true
+        panel.ignoresMouseEvents = false
+        panel.becomesKeyOnlyIfNeeded = true
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
 
-        let fx = NSVisualEffectView()
+        let fx = ClickableEffectView()
+        fx.onClick = { [weak self] in self?.onClick() }
         fx.material = .popover
         fx.state = .active
         fx.wantsLayer = true
@@ -67,5 +72,31 @@ final class SuggestionPanel {
 
     func hide() {
         panel.orderOut(nil)
+    }
+}
+
+/// Bubble background: the whole bubble is one click target, highlighted on hover.
+private final class ClickableEffectView: NSVisualEffectView {
+    var onClick: () -> Void = {}
+    private var hovering = false { didSet { isEmphasized = hovering; material = hovering ? .selection : .popover } }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    // Labels inside shouldn't swallow the click.
+    override func hitTest(_ point: NSPoint) -> NSView? { frame.contains(point) ? self : nil }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self))
+    }
+    // set() rather than push/pop: the bubble can disappear under the pointer without a mouseExited.
+    override func mouseEntered(with event: NSEvent) { hovering = true; NSCursor.pointingHand.set() }
+    override func mouseExited(with event: NSEvent) { hovering = false; NSCursor.arrow.set() }
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {
+        hovering = false
+        NSCursor.arrow.set()
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick() }
     }
 }

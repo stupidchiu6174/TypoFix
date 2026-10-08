@@ -35,6 +35,10 @@ final class Engine {
     }
 
     init() {
+        panel.onClick = { [weak self] in
+            guard let self, self.current != nil else { return }
+            self.accept()
+        }
         keyTap.onTab = { [weak self] in
             guard let self, self.current != nil, self.panel.isVisible else { return false }
             DispatchQueue.main.async { self.accept() }
