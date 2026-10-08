@@ -54,7 +54,7 @@ public final class TypoFixController: NSObject, NSMenuDelegate {
     public func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        let header = NSMenuItem(title: "打字修正（Claude Haiku 4.5・\(Settings.backend == .api ? "API" : "訂閱")）",
+        let header = NSMenuItem(title: "打字修正（Claude Haiku 5.5・\(Settings.backend == .api ? "API" : "訂閱")）",
                                 action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)

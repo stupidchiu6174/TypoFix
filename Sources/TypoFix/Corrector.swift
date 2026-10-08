@@ -118,7 +118,7 @@ final class Corrector {
 // MARK: - API key backend
 
 final class APIBackend: Backend {
-    static let model = "claude-haiku-4-5"
+    static let model = "claude-haiku-5-5"
 
     private let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
@@ -149,7 +149,11 @@ final class APIBackend: Backend {
         let body: [String: Any] = [
             "model": Self.model,
             "max_tokens": 1024,
-            "temperature": 0,
+            // Haiku 5.5:temperature 只接受預設值(送 0 會 400);
+            // 思考預設開啟,但這是要 1 秒內回應的錯字檢查,關掉思考、effort 用 low
+            // (disabled 只允許在 high 以下的 effort)。
+            "thinking": ["type": "disabled"],
+            "output_config": ["effort": "low"],
             "system": Corrector.systemPrompt,
             "messages": [["role": "user", "content": "<text>\(text)</text>"]],
         ]
@@ -167,6 +171,11 @@ final class APIBackend: Backend {
                 guard status == 200, let json else {
                     let msg = (json?["error"] as? [String: Any])?["message"] as? String ?? "HTTP \(status)"
                     completion(.failure(BackendError(message: "API 錯誤：\(msg)")))
+                    return
+                }
+                // 安全分類器拒答(HTTP 200 + stop_reason "refusal"):當作沒有錯字,不提示
+                if json["stop_reason"] as? String == "refusal" {
+                    completion(.success(text))
                     return
                 }
                 guard json["stop_reason"] as? String == "end_turn",
@@ -245,7 +254,7 @@ final class CLIBackend: Backend {
         p.executableURL = URL(fileURLWithPath: claude)
         p.currentDirectoryURL = dir
         p.arguments = [
-            "-p", "--model", "haiku",
+            "-p", "--model", APIBackend.model,
             "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
             "--system-prompt", Corrector.systemPrompt,
             "--tools", "", "--strict-mcp-config", "--setting-sources", "",
