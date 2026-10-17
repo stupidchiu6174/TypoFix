@@ -7,8 +7,18 @@ final class KeyTap {
     var onEsc: () -> Bool = { false }
 
     fileprivate var tap: CFMachPort?
+    /// Whether keys currently go through the tap. Only while a suggestion is showing: an active tap
+    /// makes every keystroke system-wide wait for our main thread, which in LiriOS is also running the
+    /// side panel, monitor, wallpaper and file browser — typing everywhere felt sluggish.
+    fileprivate(set) var active = false
 
     var isRunning: Bool { tap != nil }
+
+    func setActive(_ on: Bool) {
+        guard let t = tap, on != active else { return }
+        active = on
+        CGEvent.tapEnable(tap: t, enable: on)
+    }
 
     func start() -> Bool {
         if tap != nil { return true }
@@ -20,7 +30,9 @@ final class KeyTap {
         else { return false }
         tap = t
         CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, t, 0), .commonModes)
-        CGEvent.tapEnable(tap: t, enable: true)
+        // Created (so the permission is known to work) but idle until a suggestion appears.
+        CGEvent.tapEnable(tap: t, enable: false)
+        active = false
         return true
     }
 }
@@ -32,7 +44,7 @@ private func keyTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CG
     let me = Unmanaged<KeyTap>.fromOpaque(refcon).takeUnretainedValue()
 
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        if let t = me.tap { CGEvent.tapEnable(tap: t, enable: true) }
+        if let t = me.tap, me.active { CGEvent.tapEnable(tap: t, enable: true) }
         return pass
     }
     guard type == .keyDown,
@@ -64,6 +76,14 @@ enum Keyboard {
         for _ in 0..<count { post(51) }
     }
 
+    static func arrowLeft(_ count: Int) {
+        for _ in 0..<count { post(123) }
+    }
+
+    static func arrowRight(_ count: Int) {
+        for _ in 0..<count { post(124) }
+    }
+
     /// Paste `text` through the clipboard, then restore the clipboard's previous contents.
     static func paste(_ text: String) {
         let pb = NSPasteboard.general
@@ -78,7 +98,10 @@ enum Keyboard {
 
         post(9, flags: .maskCommand)   // ⌘V
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        // Restore late enough that the app has surely handled ⌘V: it's queued behind the arrow/backspace
+        // events, and a browser can take a while to chew through those. Restoring too early pastes the
+        // user's old clipboard instead of the fix.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             guard pb.changeCount == changeCount else { return }   // user copied something meanwhile
             pb.clearContents()
             pb.writeObjects(saved.map { d -> NSPasteboardItem in

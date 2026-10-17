@@ -8,7 +8,14 @@ struct Suggestion {
     let range: NSRange
     let wrong: String
     let right: String
-    let caret: Int
+    /// Where the checked snippet starts, and where the caret was when it was checked
+    /// (the snippet is `segmentStart..<checkedCaret`).
+    let segmentStart: Int
+    let checkedCaret: Int
+    /// The caret right now — the user may have typed on after the snippet was checked.
+    var caret: Int
+    /// How this field's AX range attributes count offsets (see AX.OffsetMap)
+    var map = AX.OffsetMap()
     let contextBefore: String
     let contextAfter: String
 
@@ -64,6 +71,8 @@ struct Suggestion {
             range: NSRange(location: segmentStart + offset, length: wrong.utf16.count),
             wrong: wrong,
             right: right,
+            segmentStart: segmentStart,
+            checkedCaret: caret,
             caret: caret,
             contextBefore: String(a[max(0, h.a.lowerBound - 4)..<h.a.lowerBound]),
             contextAfter: String(a[h.a.upperBound..<min(a.count, h.a.upperBound + 4)])
@@ -99,6 +108,18 @@ struct Suggestion {
         }
         close()
         return hunks
+    }
+
+    /// Still applicable to the field as it is now: same snippet in the same place, the user has only
+    /// typed on after it (or not at all).
+    func stillValid(text: String, caret now: Int) -> Bool {
+        Self.snippet(segment, at: segmentStart, until: checkedCaret, isIn: text, caret: now)
+    }
+
+    static func snippet(_ segment: String, at start: Int, until end: Int, isIn text: String, caret: Int) -> Bool {
+        let ns = text as NSString
+        guard caret >= end, ns.length >= end, end >= start else { return false }
+        return ns.substring(with: NSRange(location: start, length: end - start)) == segment
     }
 
     var display: NSAttributedString {

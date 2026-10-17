@@ -61,4 +61,55 @@ enum AX {
               let size = axValue(s, .cgSize, CGSize.zero) else { return nil }
         return CGRect(origin: pos, size: size)
     }
+
+    static func numberOfCharacters(_ el: AXUIElement) -> Int? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXNumberOfCharactersAttribute as CFString, &v) == .success else { return nil }
+        return (v as? NSNumber)?.intValue
+    }
+
+    /// Text offsets as the app's AX range attributes count them vs. offsets into AXValue.
+    ///
+    /// Chromium's rich-text fields (Claude's message box, for one) put a "\n" between paragraphs in
+    /// AXValue but don't count it in AXSelectedTextRange / AXNumberOfCharacters / bounds-for-range.
+    /// Without converting, every position after a line break is off by one per break: a fix for
+    /// "has" selected "as" and turned it into "hhave".
+    struct OffsetMap {
+        var skipsNewlines = false
+
+        /// Work out which way this field counts, from its AXValue and AXNumberOfCharacters.
+        static func detect(_ el: AXUIElement, text: String) -> OffsetMap {
+            let ns = text as NSString
+            let newlines = newlineCount(ns, upTo: ns.length)
+            guard newlines > 0, let n = numberOfCharacters(el) else { return OffsetMap() }
+            return OffsetMap(skipsNewlines: n == ns.length - newlines)
+        }
+
+        func toAX(_ v: Int, in text: String) -> Int {
+            guard skipsNewlines else { return v }
+            return v - Self.newlineCount(text as NSString, upTo: v)
+        }
+
+        func toAX(_ r: NSRange, in text: String) -> CFRange {
+            let start = toAX(r.location, in: text)
+            return CFRange(location: start, length: toAX(NSMaxRange(r), in: text) - start)
+        }
+
+        func toValue(_ a: Int, in text: String) -> Int {
+            guard skipsNewlines else { return a }
+            let ns = text as NSString
+            var counted = 0, i = 0
+            while i < ns.length, counted < a {
+                if ns.character(at: i) != 10 { counted += 1 }
+                i += 1
+            }
+            return i
+        }
+
+        private static func newlineCount(_ ns: NSString, upTo end: Int) -> Int {
+            var n = 0
+            for i in 0..<min(max(end, 0), ns.length) where ns.character(at: i) == 10 { n += 1 }
+            return n
+        }
+    }
 }
