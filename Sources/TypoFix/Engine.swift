@@ -13,7 +13,7 @@ private struct FieldSnapshot {
     func sameField(_ o: FieldSnapshot) -> Bool { CFEqual(element, o.element) }
 }
 
-/// Watches the focused text field, debounces, asks Claude, shows / applies suggestions.
+/// Watches the focused text field, debounces, asks Claude, underlines typos (Grammarly-style) and applies fixes.
 final class Engine {
     let corrector = Corrector(kind: Settings.backend)
     private let panel = SuggestionPanel()
@@ -22,8 +22,23 @@ final class Engine {
     private var pollTimer: Timer?
     private var debounce: Timer?
     private var last: FieldSnapshot?
-    private var current: Suggestion?
+    /// Typos found in the focused field, in text order. Underlined until fixed, ignored or edited away.
+    private var issues: [Suggestion] = []
+    /// The typo whose card is showing.
+    private var shown: Suggestion?
+    /// `Suggestion.key`s the user dismissed.
     private var ignored = Set<String>()
+    private let overlay = UnderlineOverlay()
+    private let badge = IssueBadge()
+    /// Each underlined typo's screen rect (Accessibility coordinates), for hover hit-testing.
+    private var issueRects: [(issue: Suggestion, rect: CGRect)] = []
+    private var mouseMonitor: Any?
+    private var hideCard: DispatchWorkItem?
+    private var overCard = false
+    /// When the focused field stopped being readable; brief losses (clicking the card or the badge makes
+    /// Chromium drop its focused element for a moment) shouldn't wipe the underlines.
+    private var lostSince: Date?
+    private var lastLoggedRects = ""
     private var touchedPids = Set<pid_t>()
     /// Apps seen ignoring AX text writes (Chrome): go straight to select + paste next time, instead of
     /// trying AX first and leaving the typo selected while waiting to see whether it took.
@@ -47,19 +62,22 @@ final class Engine {
     }
 
     init() {
-        panel.onClick = { [weak self] in
-            guard let self, self.current != nil else { return }
-            self.accept()
+        panel.onAccept = { [weak self] in self?.acceptShown() }
+        panel.onIgnore = { [weak self] in self?.ignoreShown() }
+        panel.onHover = { [weak self] inside in
+            guard let self else { return }
+            self.overCard = inside
+            if inside { self.cancelHideCard() } else { self.scheduleHideCard() }
         }
+        badge.onClick = { [weak self] in self?.openNearest() }
         keyTap.onTab = { [weak self] in
-            guard let self, self.current != nil, self.panel.isVisible else { return false }
-            DispatchQueue.main.async { self.accept() }
+            guard let self, self.shown != nil, self.panel.isVisible else { return false }
+            DispatchQueue.main.async { self.acceptShown() }
             return true
         }
         keyTap.onEsc = { [weak self] in
-            guard let self, let s = self.current, self.panel.isVisible else { return false }
-            self.ignored.insert(s.segment)
-            DispatchQueue.main.async { self.dismiss() }
+            guard let self, self.shown != nil, self.panel.isVisible else { return false }
+            DispatchQueue.main.async { self.ignoreShown() }
             return true
         }
     }
@@ -161,44 +179,45 @@ final class Engine {
         composing = false
         guard enabled, let snap = readFocused() else {
             if composing {
-                // Mid-composition: hide the bubble (Tab / Esc belong to the input method now) but keep the
-                // check that's running — resetting here dropped nearly every check while typing CJK.
-                if current != nil { dismiss() }
+                // Mid-composition: hide the card (Tab / Esc belong to the input method now) but keep the
+                // underlines and the check that's running — resetting here dropped nearly every check while typing CJK.
+                if shown != nil { dismiss() }
                 return
             }
-            if last != nil || current != nil { reset() }
+            guard last != nil || !issues.isEmpty else { return }
+            let since = lostSince ?? Date()
+            lostSince = since
+            if Date().timeIntervalSince(since) > 1.5 { reset() }
             return
         }
-        if let l = last, l.sameField(snap), l.text == snap.text, l.caret == snap.caret { return }
+        lostSince = nil
+        if let l = last, l.sameField(snap), l.text == snap.text, l.caret == snap.caret {
+            refreshMarks()   // the field may have scrolled or moved
+            return
+        }
         watchForGhostText(previous: last, now: snap)
 
-        let textChanged = last.map { !$0.sameField(snap) || $0.text != snap.text } ?? true
-        // Typing on after the caret leaves everything already checked untouched: keep the check that's
-        // in flight and any suggestion that's showing. A check takes 2–4 s on the subscription backend,
-        // and dropping it on every keystroke meant ~9 in 10 checks never produced anything — fixes only
-        // showed up after a long pause.
-        let typedOn = last.map { $0.sameField(snap) && Self.typedOn(from: $0, to: snap) } ?? false
+        let sameField = last.map { $0.sameField(snap) } ?? false
+        let textChanged = last.map { !sameField || $0.text != snap.text } ?? true
         last = snap
-        if typedOn {
-            if let s = current, !s.stillValid(text: snap.text, caret: snap.caret) { dismiss() }
-        } else {
-            dismiss()
+        if !sameField {
+            clearIssues()
             corrector.cancel()
+        } else if textChanged {
+            // Keep the check running: a check takes 2–4 s on the subscription backend, and Electron apps put
+            // the IME's unconfirmed Zhuyin straight into the text, so every character picked "edits" the text
+            // before the caret — cancelling on edits dropped ~98% of checks. A stale answer is rejected when
+            // it arrives. Typos elsewhere follow the text around them.
+            issues = issues.compactMap { $0.relocated(in: snap.text) }
+            if let s = shown, !issues.contains(where: { $0.key == s.key }) { dismiss() }
         }
+        refreshMarks()
         debounce?.invalidate()
         debounce = nil
         guard textChanged else { return }
         debounce = Timer.scheduledTimer(withTimeInterval: Settings.delay, repeats: false) { [weak self] _ in
             self?.check()
         }
-    }
-
-    /// The text before the old caret is unchanged and the caret didn't move back.
-    private static func typedOn(from old: FieldSnapshot, to new: FieldSnapshot) -> Bool {
-        let o = old.text as NSString, n = new.text as NSString
-        guard new.caret >= old.caret, n.length >= old.caret, o.length >= old.caret else { return false }
-        let r = NSRange(location: 0, length: old.caret)
-        return o.substring(with: r) == n.substring(with: r)
     }
 
     // MARK: - Ghost-text detector (diagnostics)
@@ -233,7 +252,7 @@ final class Engine {
         let accept = lastAcceptAt.map { String(format: "%.0fs ago", Date().timeIntervalSince($0)) } ?? "never"
         Log.write("GHOST? \(snap.app) \(snap.role) now 「\(Log.preview(nowTrim, 80))」"
                   + " matches text cleared \(String(format: "%.0f", ago))s ago in \(hit.app) 「\(Log.preview(hit.text, 80))」"
-                  + " | sameField=\(sameField) suggestion=\(current != nil) keyTapActive=\(keyTap.active) lastAccept=\(accept)")
+                  + " | sameField=\(sameField) card=\(shown != nil) keyTapActive=\(keyTap.active) lastAccept=\(accept)")
     }
 
     private func reset() {
@@ -241,7 +260,7 @@ final class Engine {
         debounce?.invalidate()
         debounce = nil
         corrector.cancel()
-        dismiss()
+        clearIssues()
     }
 
     // MARK: - Checking
@@ -259,14 +278,21 @@ final class Engine {
         return start
     }
 
+    /// Bopomofo letters and tone marks (ˊˇˋ˙).
+    private static func isZhuyin(_ u: Unicode.Scalar) -> Bool {
+        (0x3100...0x312F).contains(u.value) || (0x31A0...0x31BF).contains(u.value)
+            || [0x02CA, 0x02C7, 0x02CB, 0x02D9].contains(u.value)
+    }
+
     private func check() {
         guard enabled, let snap = last else { return }
         let ns = snap.text as NSString
         let start = segmentStart(in: ns, caret: snap.caret)
         guard snap.caret > start else { return }
         let segment = ns.substring(with: NSRange(location: start, length: snap.caret - start))
-        guard segment.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2,
-              !ignored.contains(segment) else { return }
+        guard segment.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2 else { return }
+        // Zhuyin still being composed (shows up as plain text in Electron apps): wait for the characters.
+        if let tail = segment.unicodeScalars.last, Self.isZhuyin(tail) { return }
 
         setStatus("檢查中…")
         Log.write("check 「\(Log.preview(segment))」")
@@ -276,74 +302,181 @@ final class Engine {
             self.setStatus(self.corrector.lastError ?? "就緒")
             Log.write(String(format: "result %.2fs 「%@」%@", Date().timeIntervalSince(sentAt),
                              Log.preview(fixed ?? "nil"), self.corrector.lastError.map { " error: " + $0 } ?? ""))
-            // Use the answer as long as the snippet is still there unchanged (typing on after it is fine).
+            // Use the answer as long as the snippet is still where it was (typing on after it is fine).
+            let range = NSRange(location: start, length: snap.caret - start)
             guard let fixed, let now = self.last, now.sameField(snap),
-                  Suggestion.snippet(segment, at: start, until: snap.caret, isIn: now.text, caret: now.caret),
-                  var s = Suggestion.make(element: snap.element, segment: segment, corrected: fixed,
-                                          segmentStart: start, caret: snap.caret)
+                  NSMaxRange(range) <= (now.text as NSString).length,
+                  (now.text as NSString).substring(with: range) == segment
             else {
-                if fixed != nil, fixed != segment { Log.write("no suggestion (stale, or change too big / at the end)") }
+                if fixed != nil, fixed != segment { Log.write("no suggestion (stale)") }
                 return
             }
-            s.caret = now.caret
-            s.map = now.map
-            // Don't pop up mid-composition; the answer is cached, so the check after it ends is instant.
-            if self.composing { return }
-            // A newer suggestion for the same spot is already up: keep it.
-            if let cur = self.current, cur.range == s.range, cur.right == s.right { return }
-            self.current = s
-            Log.write("suggest 「\(s.wrong)」→「\(s.right)」")
-            self.panel.show(s.display, anchor: self.anchor(for: s))
-            self.keyTap.setActive(true)   // Tab / Esc only need intercepting while the bubble is up
+            let found = Suggestion.all(element: snap.element, segment: segment, corrected: fixed,
+                                       segmentStart: start, caret: snap.caret)
+                .filter { !self.ignored.contains($0.key) }
+            if found.isEmpty, fixed != segment { Log.write("no suggestion (change too big / at the end)") }
+            // This snippet's answer replaces whatever was found in it before.
+            self.issues.removeAll { NSLocationInRange($0.range.location, range) }
+            self.issues.append(contentsOf: found)
+            self.issues.sort { $0.range.location < $1.range.location }
+            for s in found { Log.write("issue 「\(s.wrong)」→「\(s.right)」") }
+            self.refreshMarks()
         }
     }
 
-    private func anchor(for s: Suggestion) -> CGRect {
-        let el = s.element
-        let text = last?.text ?? ""
-        func ax(_ r: NSRange) -> CFRange { s.map.toAX(r, in: text) }
-        if s.range.length > 0, let r = AX.bounds(el, ax(s.range)) {
-            return r
+    // MARK: - Underlines, badge, card
+
+    /// Text leaves of the focused field, re-read only when its text changes.
+    private var leafCache: (text: String, leaves: [AX.Leaf])?
+
+    /// Screen rect of a typo; an insertion marks the character before it.
+    private func rect(for s: Suggestion, in snap: FieldSnapshot, field: CGRect) -> CGRect? {
+        let r = s.range.length > 0 ? s.range : NSRange(location: s.range.location - 1, length: 1)
+        guard r.location >= 0 else { return nil }
+        // Chromium can answer with the whole web view instead of the text: only trust rects that fit the field.
+        func sane(_ b: CGRect) -> Bool { field.insetBy(dx: -40, dy: -40).contains(b) && b.height <= 60 }
+        if let b = AX.bounds(s.element, snap.map.toAX(r, in: snap.text)), sane(b) { return b }
+        if leafCache?.text != snap.text { leafCache = (snap.text, AX.textLeaves(snap.element, text: snap.text)) }
+        if let b = AX.leafBounds(leafCache?.leaves ?? [], r), sane(b) { return b }
+        return nil
+    }
+
+    private func refreshMarks() {
+        guard !issues.isEmpty, let snap = last, let field = AX.frame(snap.element) else {
+            issueRects = []
+            overlay.hide()
+            badge.hide()
+            if issues.isEmpty, shown != nil { dismiss() }
+            updateMouseMonitor()
+            return
         }
-        if s.range.location > 0, let r = AX.bounds(el, ax(NSRange(location: s.range.location - 1, length: 1))) {
-            return r
+        issueRects = issues.prefix(30).compactMap { s in rect(for: s, in: snap, field: field).map { (s, $0) } }
+        let logged = issueRects.map { "\($0.issue.wrong)@\($0.issue.range.location)" }.joined(separator: ",")
+        if logged != lastLoggedRects {
+            lastLoggedRects = logged
+            Log.write("marks field=\(field) " + issueRects.map { "「\($0.issue.wrong)」\($0.rect)" }.joined(separator: " "))
         }
-        if s.caret > 0, let r = AX.bounds(el, ax(NSRange(location: s.caret - 1, length: 1))) { return r }
-        if let f = AX.frame(el) { return CGRect(x: f.minX, y: f.maxY - 1, width: 1, height: 1) }
+        overlay.update(field: field, typos: issueRects.map(\.rect).filter { $0.intersects(field) })
+        badge.update(count: issues.count, field: field)
+        updateMouseMonitor()
+    }
+
+    /// Hover detection over other apps' windows, only while there's something underlined.
+    private func updateMouseMonitor() {
+        if issues.isEmpty {
+            if let m = mouseMonitor { NSEvent.removeMonitor(m) }
+            mouseMonitor = nil
+        } else if mouseMonitor == nil {
+            mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [weak self] _ in
+                self?.mouseMoved()
+            }
+        }
+    }
+
+    private func mouseMoved() {
         let m = NSEvent.mouseLocation
-        let h = NSScreen.screens.first?.frame.height ?? 0
-        return CGRect(x: m.x, y: h - m.y, width: 1, height: 16)
+        let p = CGPoint(x: m.x, y: (NSScreen.screens.first?.frame.height ?? 0) - m.y)
+        if let hit = issueRects.first(where: { Self.hoverArea($0.rect).contains(p) }) {
+            cancelHideCard()
+            if shown?.key != hit.issue.key {
+                Log.write("hover 「\(hit.issue.wrong)」")
+                show(hit.issue, at: hit.rect)
+            }
+        } else if shown != nil, !overCard {
+            scheduleHideCard()
+        }
+    }
+
+    /// The whole line height over the typo, a little wider: some apps report a thin rect at the baseline.
+    private static func hoverArea(_ r: CGRect) -> CGRect {
+        let h = max(r.height, 18)
+        return CGRect(x: r.minX - 3, y: r.maxY - h - 2, width: max(r.width, 6) + 6, height: h + 6)
+    }
+
+    /// Badge clicked: open the typo just before the caret, or the first one.
+    private func openNearest() {
+        Log.write("badge clicked, \(issueRects.count) underlined")
+        guard let snap = last else { return }
+        guard let pick = issueRects.last(where: { $0.issue.range.location <= snap.caret }) ?? issueRects.first
+        else { return }
+        show(pick.issue, at: pick.rect)
+    }
+
+    private func show(_ s: Suggestion, at rect: CGRect) {
+        shown = s
+        panel.show(s.display, anchor: rect)
+        keyTap.setActive(true)   // Tab / Esc only need intercepting while the card is up
+    }
+
+    /// Leaving the typo or the card hides the card after a moment — long enough to move from one to the other.
+    private func scheduleHideCard() {
+        if let w = hideCard, !w.isCancelled { return }
+        let w = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.hideCard = nil
+            if !self.overCard { self.dismiss() }
+        }
+        hideCard = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: w)
+    }
+
+    private func cancelHideCard() {
+        hideCard?.cancel()
+        hideCard = nil
     }
 
     private func dismiss() {
-        current = nil
+        cancelHideCard()
+        overCard = false
+        shown = nil
         panel.hide()
         keyTap.setActive(false)
     }
 
+    private func clearIssues() {
+        issues = []
+        refreshMarks()
+        dismiss()
+    }
+
+    private func acceptShown() {
+        guard let key = shown?.key, let s = issues.first(where: { $0.key == key }) else { dismiss(); return }
+        issues.removeAll { $0.key == key }
+        dismiss()
+        refreshMarks()
+        accept(s)
+    }
+
+    private func ignoreShown() {
+        guard let key = shown?.key else { return }
+        ignored.insert(key)
+        issues.removeAll { $0.key == key }
+        dismiss()
+        refreshMarks()
+    }
+
     // MARK: - Applying
 
-    private func accept() {
-        guard var s = current else { return }
-        dismiss()
+    private func accept(_ issue: Suggestion) {
+        var s = issue
         let el = s.element
 
-        // Re-validate against what's in the field right now (the user may have typed on since).
+        // Re-locate against what's in the field right now (the user may have edited since).
         guard let text = AX.string(el, kAXValueAttribute),
               let r = AX.selectedRange(el), r.length == 0 else { NSSound.beep(); return }
+        guard let moved = s.relocated(in: text) else { NSSound.beep(); return }
+        s = moved
         s.map = AX.OffsetMap.detect(el, text: text)
         let caret = s.map.toValue(r.location, in: text)
-        guard s.stillValid(text: text, caret: caret) else { NSSound.beep(); return }
         let ns = text as NSString
         guard NSMaxRange(s.range) <= ns.length, ns.substring(with: s.range) == s.wrong else { NSSound.beep(); return }
         s.caret = caret
 
         let expected = ns.replacingCharacters(in: s.range, with: s.right)
-        let newCaret = s.caret + s.right.utf16.count - s.wrong.utf16.count
-        // Seed the cache so the next typo in the same snippet shows up without another API call.
-        let segStart = s.segmentStart
+        let newCaret = Self.caretAfterFix(s)
+        // Seed the cache so the snippet's other typos come back without another API call.
         let newSegment = (s.segment as NSString).replacingCharacters(
-            in: NSRange(location: s.range.location - segStart, length: s.range.length), with: s.right)
+            in: NSRange(location: s.segmentOffset, length: s.range.length), with: s.right)
         corrector.remember(newSegment, s.corrected)
 
         Log.write("accept 「\(s.wrong)」→「\(s.right)」")
@@ -401,10 +534,11 @@ final class Engine {
         let el = s.element
         let original = ns as String
         let end = NSMaxRange(s.range)
-        let tailCount = ns.substring(with: NSRange(location: end, length: s.caret - end)).count
+        // Characters between the typo and the caret (none when the caret is before the typo).
+        let tailCount = s.caret >= end ? ns.substring(with: NSRange(location: end, length: s.caret - end)).count : 0
         let removed = ns.replacingCharacters(in: s.range, with: "")
         let expected = ns.replacingCharacters(in: s.range, with: s.right)
-        let newCaret = s.caret + s.right.utf16.count - s.wrong.utf16.count
+        let newCaret = Self.caretAfterFix(s)
         let value = { AX.string(el, kAXValueAttribute) }
         /// `r` is in AXValue offsets of `text`; compared in the app's own counting.
         func selection(is r: NSRange, in text: String) -> Bool {
@@ -445,10 +579,21 @@ final class Engine {
                              tries: 5, then: {}, otherwise: { Keyboard.arrowRight(tailCount) })
             }
         }, otherwise: {
+            // Arrowing back only reaches typos before the caret.
+            guard s.caret >= end else {
+                Log.write("accept: can't select the typo and it's after the caret, not touching the text")
+                NSSound.beep()
+                return
+            }
             // Selection can't be set through AX: put the caret back where the user left it, use arrows.
             _ = AX.setSelectedRange(el, CFRange(location: s.map.toAX(s.caret, in: original), length: 0))
             viaArrows()
         })
+    }
+
+    /// Where the caret ends up: shifted by the fix only when the typo is before it.
+    private static func caretAfterFix(_ s: Suggestion) -> Int {
+        s.caret >= NSMaxRange(s.range) ? s.caret + s.right.utf16.count - s.wrong.utf16.count : s.caret
     }
 
     /// The app's current selection holds exactly the typo (or, for an insertion, sits right after the

@@ -5,12 +5,15 @@ struct Suggestion {
     let element: AXUIElement
     let segment: String       // the snippet that was checked
     let corrected: String     // the snippet after the fix
-    let range: NSRange
+    /// Moves as the user edits elsewhere in the field (see `relocated(in:)`).
+    var range: NSRange
     let wrong: String
     let right: String
     /// Where the checked snippet starts, and where the caret was when it was checked
     /// (the snippet is `segmentStart..<checkedCaret`).
     let segmentStart: Int
+    /// Where the typo sat inside the snippet (`range` moves, this doesn't).
+    let segmentOffset: Int
     let checkedCaret: Int
     /// The caret right now — the user may have typed on after the snippet was checked.
     var caret: Int
@@ -19,12 +22,12 @@ struct Suggestion {
     let contextBefore: String
     let contextAfter: String
 
-    /// Diff `original` against `corrected` and return the first changed spot, or nil when
-    /// there is no change or it looks like a rewrite rather than a typo fix.
-    static func make(element: AXUIElement, segment original: String, corrected: String,
-                     segmentStart: Int, caret: Int) -> Suggestion? {
+    /// Diff `original` against `corrected` and return every changed spot, or nothing when there is no
+    /// change or it looks like a rewrite rather than typo fixes.
+    static func all(element: AXUIElement, segment original: String, corrected: String,
+                    segmentStart: Int, caret: Int) -> [Suggestion] {
         let a = Array(original), b = Array(corrected)
-        guard a != b, !a.isEmpty else { return nil }
+        guard a != b, !a.isEmpty else { return [] }
         func isWordChar(_ c: Character) -> Bool { c.isASCII && (c.isLetter || c.isNumber) }
 
         // LCS splits "ie→ei" into two edits; merge edits separated only by a couple of letters.
@@ -37,46 +40,58 @@ struct Suggestion {
                 hunks.append(h)
             }
         }
-        guard var h = hunks.first else { return nil }
+        guard !hunks.isEmpty else { return [] }
 
         // Typo fixes are small; anything bigger is the model rewriting.
         let changed = hunks.reduce(0) { $0 + max($1.a.count, $1.b.count) }
-        if changed > max(6, a.count / 3) || hunks.contains(where: { max($0.a.count, $0.b.count) > 8 }) { return nil }
+        if changed > max(6, a.count / 3) || hunks.contains(where: { max($0.a.count, $0.b.count) > 8 }) { return [] }
 
-        // Widen English edits to the whole word so the bubble shows "recieve → receive".
-        while h.a.lowerBound > 0, isWordChar(a[h.a.lowerBound - 1]),
-              (!h.a.isEmpty && isWordChar(a[h.a.lowerBound])) || (!h.b.isEmpty && isWordChar(b[h.b.lowerBound])) {
-            h.a = (h.a.lowerBound - 1)..<h.a.upperBound
-            h.b = (h.b.lowerBound - 1)..<h.b.upperBound
-        }
-        while h.a.upperBound < a.count, h.b.upperBound < b.count, a[h.a.upperBound] == b[h.b.upperBound],
-              isWordChar(a[h.a.upperBound]),
-              (!h.a.isEmpty && isWordChar(a[h.a.upperBound - 1])) || (!h.b.isEmpty && isWordChar(b[h.b.upperBound - 1])) {
-            h.a = h.a.lowerBound..<(h.a.upperBound + 1)
-            h.b = h.b.lowerBound..<(h.b.upperBound + 1)
+        var widened: [Hunk] = []
+        for var h in hunks {
+            // Widen English edits to the whole word so the card shows "recieve → receive".
+            while h.a.lowerBound > 0, isWordChar(a[h.a.lowerBound - 1]),
+                  (!h.a.isEmpty && isWordChar(a[h.a.lowerBound])) || (!h.b.isEmpty && isWordChar(b[h.b.lowerBound])) {
+                h.a = (h.a.lowerBound - 1)..<h.a.upperBound
+                h.b = (h.b.lowerBound - 1)..<h.b.upperBound
+            }
+            while h.a.upperBound < a.count, h.b.upperBound < b.count, a[h.a.upperBound] == b[h.b.upperBound],
+                  isWordChar(a[h.a.upperBound]),
+                  (!h.a.isEmpty && isWordChar(a[h.a.upperBound - 1])) || (!h.b.isEmpty && isWordChar(b[h.b.upperBound - 1])) {
+                h.a = h.a.lowerBound..<(h.a.upperBound + 1)
+                h.b = h.b.lowerBound..<(h.b.upperBound + 1)
+            }
+            // Two edits in one word end up overlapping once widened: one issue.
+            if let prev = widened.last, h.a.lowerBound <= prev.a.upperBound {
+                widened[widened.count - 1] = Hunk(a: prev.a.lowerBound..<max(prev.a.upperBound, h.a.upperBound),
+                                                  b: prev.b.lowerBound..<max(prev.b.upperBound, h.b.upperBound))
+            } else {
+                widened.append(h)
+            }
         }
 
-        // Don't touch the very end when it may still be being typed.
-        if h.a.upperBound == a.count {
-            if h.a.isEmpty { return nil }                                   // pure append
-            if let last = a.last, isWordChar(last) { return nil }           // unfinished English word
+        return widened.compactMap { h in
+            // Don't touch the very end when it may still be being typed.
+            if h.a.upperBound == a.count {
+                if h.a.isEmpty { return nil }                                   // pure append
+                if let last = a.last, isWordChar(last) { return nil }           // unfinished English word
+            }
+            let wrong = String(a[h.a]), right = String(b[h.b])
+            let offset = String(a[0..<h.a.lowerBound]).utf16.count
+            return Suggestion(
+                element: element,
+                segment: original,
+                corrected: corrected,
+                range: NSRange(location: segmentStart + offset, length: wrong.utf16.count),
+                wrong: wrong,
+                right: right,
+                segmentStart: segmentStart,
+                segmentOffset: offset,
+                checkedCaret: caret,
+                caret: caret,
+                contextBefore: String(a[max(0, h.a.lowerBound - 4)..<h.a.lowerBound]),
+                contextAfter: String(a[h.a.upperBound..<min(a.count, h.a.upperBound + 4)])
+            )
         }
-
-        let wrong = String(a[h.a]), right = String(b[h.b])
-        let offset = String(a[0..<h.a.lowerBound]).utf16.count
-        return Suggestion(
-            element: element,
-            segment: original,
-            corrected: corrected,
-            range: NSRange(location: segmentStart + offset, length: wrong.utf16.count),
-            wrong: wrong,
-            right: right,
-            segmentStart: segmentStart,
-            checkedCaret: caret,
-            caret: caret,
-            contextBefore: String(a[max(0, h.a.lowerBound - 4)..<h.a.lowerBound]),
-            contextAfter: String(a[h.a.upperBound..<min(a.count, h.a.upperBound + 4)])
-        )
     }
 
     struct Hunk { var a: Range<Int>; var b: Range<Int> }
@@ -110,16 +125,30 @@ struct Suggestion {
         return hunks
     }
 
-    /// Still applicable to the field as it is now: same snippet in the same place, the user has only
-    /// typed on after it (or not at all).
-    func stillValid(text: String, caret now: Int) -> Bool {
-        Self.snippet(segment, at: segmentStart, until: checkedCaret, isIn: text, caret: now)
-    }
+    /// Identifies "this fix at this spot" for ignoring, independent of where it has moved to.
+    var key: String { contextBefore + "\u{1}" + wrong + "\u{1}" + contextAfter + "\u{1}" + right }
 
-    static func snippet(_ segment: String, at start: Int, until end: Int, isIn text: String, caret: Int) -> Bool {
+    /// The same typo in `text` after edits elsewhere: found by its surrounding context, nearest to where
+    /// it was. Nil once the typo or the few characters around it have been edited.
+    func relocated(in text: String) -> Suggestion? {
         let ns = text as NSString
-        guard caret >= end, ns.length >= end, end >= start else { return false }
-        return ns.substring(with: NSRange(location: start, length: end - start)) == segment
+        let needle = contextBefore + wrong + contextAfter
+        let lead = contextBefore.utf16.count
+        let expected = range.location - lead
+        if expected >= 0, expected + needle.utf16.count <= ns.length,
+           ns.substring(with: NSRange(location: expected, length: needle.utf16.count)) == needle { return self }
+        var best: Int?
+        var from = 0
+        while from < ns.length {
+            let r = ns.range(of: needle, options: .literal, range: NSRange(location: from, length: ns.length - from))
+            if r.location == NSNotFound { break }
+            if best.map({ abs(r.location - expected) < abs($0 - expected) }) ?? true { best = r.location }
+            from = r.location + 1
+        }
+        guard let best else { return nil }
+        var s = self
+        s.range.location = best + lead
+        return s
     }
 
     var display: NSAttributedString {

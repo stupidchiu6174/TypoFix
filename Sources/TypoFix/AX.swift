@@ -41,15 +41,104 @@ enum AX {
     }
 
     /// Screen rect (top-left origin) of a text range, if the app supports it.
+    /// Chromium's rich-text fields (Claude's message box) fail AXBoundsForRange; for those, go through
+    /// text markers instead.
     static func bounds(_ el: AXUIElement, _ r: CFRange) -> CGRect? {
-        var r = r
-        guard let rv = AXValueCreate(.cfRange, &r) else { return nil }
-        var v: CFTypeRef?
-        guard AXUIElementCopyParameterizedAttributeValue(
-            el, kAXBoundsForRangeParameterizedAttribute as CFString, rv, &v) == .success else { return nil }
+        rangeBounds(el, r) ?? markerBounds(el, r)
+    }
+
+    private static func usable(_ v: CFTypeRef?) -> CGRect? {
         guard let rect = axValue(v, .cgRect, CGRect.zero), rect.width > 0 || rect.height > 0,
               rect.origin != .zero else { return nil }
         return rect
+    }
+
+    private static func rangeBounds(_ el: AXUIElement, _ r: CFRange) -> CGRect? {
+        var r = r
+        guard let rv = AXValueCreate(.cfRange, &r) else { return nil }
+        var v: CFTypeRef?
+        let err = AXUIElementCopyParameterizedAttributeValue(el, kAXBoundsForRangeParameterizedAttribute as CFString, rv, &v)
+        guard err == .success else { noteFailure("AXBoundsForRange error \(err.rawValue)"); return nil }
+        guard let rect = usable(v) else { noteFailure("AXBoundsForRange returned an empty rect"); return nil }
+        return rect
+    }
+
+    private static func parameterized(_ el: AXUIElement, _ name: String, _ arg: CFTypeRef) -> CFTypeRef? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(el, name as CFString, arg, &v) == .success else { return nil }
+        return v
+    }
+
+    private static func markerBounds(_ el: AXUIElement, _ r: CFRange) -> CGRect? {
+        guard let start = parameterized(el, "AXTextMarkerForIndex", r.location as CFNumber),
+              let end = parameterized(el, "AXTextMarkerForIndex", (r.location + r.length) as CFNumber)
+        else { noteFailure("AXTextMarkerForIndex unsupported"); return nil }
+        guard let range = parameterized(el, "AXTextMarkerRangeForUnorderedTextMarkers", [start, end] as CFArray)
+        else { noteFailure("AXTextMarkerRangeForUnorderedTextMarkers unsupported"); return nil }
+        guard let rect = usable(parameterized(el, "AXBoundsForTextMarkerRange", range))
+        else { noteFailure("AXBoundsForTextMarkerRange gave nothing"); return nil }
+        return rect
+    }
+
+    // MARK: Text leaves (Chromium rich-text fields)
+
+    /// A run of text inside a field: Chromium answers AXBoundsForRange on these even when the field
+    /// itself (a contenteditable like Claude's message box) doesn't.
+    struct Leaf {
+        let element: AXUIElement
+        let start: Int    // UTF-16 offset in the field's AXValue
+        let length: Int
+    }
+
+    static func children(_ el: AXUIElement) -> [AXUIElement] {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &v) == .success,
+              let arr = v as? [AXUIElement] else { return [] }
+        return arr
+    }
+
+    /// The field's static-text descendants in order, each matched to where its text sits in `text`.
+    static func textLeaves(_ root: AXUIElement, text: String) -> [Leaf] {
+        let ns = text as NSString
+        var out: [Leaf] = []
+        var cursor = 0, visited = 0
+        func walk(_ el: AXUIElement, depth: Int) {
+            guard depth < 8, visited < 400 else { return }
+            visited += 1
+            if string(el, kAXRoleAttribute) == kAXStaticTextRole as String,
+               let v = string(el, kAXValueAttribute), !v.isEmpty {
+                let r = ns.range(of: v, options: .literal, range: NSRange(location: cursor, length: ns.length - cursor))
+                if r.location != NSNotFound {
+                    out.append(Leaf(element: el, start: r.location, length: r.length))
+                    cursor = NSMaxRange(r)
+                }
+                return
+            }
+            for c in children(el) { walk(c, depth: depth + 1) }
+        }
+        for c in children(root) { walk(c, depth: 0) }
+        return out
+    }
+
+    /// Screen rect of `r` (AXValue offsets of the field) through the leaf holding it. When the leaf won't
+    /// say either, estimate from the leaf's frame — fine for a single line.
+    static func leafBounds(_ leaves: [Leaf], _ r: NSRange) -> CGRect? {
+        guard let leaf = leaves.first(where: { r.location >= $0.start && r.location < $0.start + $0.length })
+        else { noteFailure("no text leaf holds the typo"); return nil }
+        let local = r.location - leaf.start
+        let len = max(1, min(r.length, leaf.start + leaf.length - r.location))
+        if let b = rangeBounds(leaf.element, CFRange(location: local, length: len)) { return b }
+        guard let f = frame(leaf.element), f.width > 0, leaf.length > 0 else { noteFailure("text leaf has no frame"); return nil }
+        noteFailure("estimating from the text leaf's frame")
+        let unit = f.width / CGFloat(leaf.length)
+        return CGRect(x: f.minX + unit * CGFloat(local), y: f.minY, width: unit * CGFloat(len), height: min(f.height, 24))
+    }
+
+    /// Log each distinct reason a bounds lookup failed, once.
+    private static var notedFailures = Set<String>()
+    private static func noteFailure(_ why: String) {
+        guard notedFailures.insert(why).inserted else { return }
+        Log.write("bounds: \(why)")
     }
 
     /// Screen rect (top-left origin) of the element itself.

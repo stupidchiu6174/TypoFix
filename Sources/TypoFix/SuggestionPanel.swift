@@ -1,18 +1,22 @@
 import AppKit
 
-/// Small floating bubble near the caret. Clicking it applies the fix; it never takes focus,
-/// so the caret stays in the app being typed in.
+/// Suggestion card shown when hovering an underlined typo (or clicking the count badge).
+/// Never takes focus, so the caret stays in the app being typed in.
 final class SuggestionPanel {
     private let panel: NSPanel
     private let label = NSTextField(labelWithString: "")
-    private let hint = NSTextField(labelWithString: "點一下或 Tab 套用　Esc 略過")
+    private let hint = NSTextField(labelWithString: "Tab 套用　Esc 略過")
 
     var isVisible: Bool { panel.isVisible }
-    /// Called when the bubble is clicked.
-    var onClick: () -> Void = {}
+    /// Screen frame in Cocoa coordinates, for hover hit-testing.
+    var frame: NSRect { panel.frame }
+    var onAccept: () -> Void = {}
+    var onIgnore: () -> Void = {}
+    /// The pointer entered (true) or left (false) the card.
+    var onHover: (Bool) -> Void = { _ in }
 
     init() {
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 200, height: 50),
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 200, height: 60),
                         styleMask: [.borderless, .nonactivatingPanel],
                         backing: .buffered, defer: true)
         panel.level = .statusBar
@@ -24,22 +28,36 @@ final class SuggestionPanel {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
 
-        let fx = ClickableEffectView()
-        fx.onClick = { [weak self] in self?.onClick() }
+        let fx = HoverEffectView()
+        fx.onHover = { [weak self] in self?.onHover($0) }
         fx.material = .popover
         fx.state = .active
         fx.wantsLayer = true
-        fx.layer?.cornerRadius = 8
+        fx.layer?.cornerRadius = 10
         fx.layer?.masksToBounds = true
 
         hint.font = .systemFont(ofSize: 11)
         hint.textColor = .tertiaryLabelColor
 
-        let stack = NSStackView(views: [label, hint])
+        let accept = FirstMouseButton(title: "套用", target: nil, action: nil)
+        accept.onPress = { [weak self] in self?.onAccept() }
+        accept.bezelStyle = .push
+        accept.controlSize = .small
+        accept.keyEquivalent = "\r"   // drawn as the default button; Return itself still goes to the app
+        let ignore = FirstMouseButton(title: "略過", target: nil, action: nil)
+        ignore.onPress = { [weak self] in self?.onIgnore() }
+        ignore.bezelStyle = .push
+        ignore.controlSize = .small
+
+        let buttons = NSStackView(views: [accept, ignore, hint])
+        buttons.orientation = .horizontal
+        buttons.spacing = 6
+
+        let stack = NSStackView(views: [label, buttons])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 2
-        stack.edgeInsets = NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 10)
+        stack.spacing = 6
+        stack.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
         stack.translatesAutoresizingMaskIntoConstraints = false
         fx.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -58,12 +76,12 @@ final class SuggestionPanel {
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
 
         // Convert to Cocoa coordinates (origin bottom-left) and place just below the anchor.
-        var origin = NSPoint(x: anchor.minX, y: primaryHeight - anchor.maxY - 6 - size.height)
+        var origin = NSPoint(x: anchor.minX, y: primaryHeight - anchor.maxY - 4 - size.height)
         let screen = NSScreen.screens.first(where: {
             $0.frame.contains(NSPoint(x: anchor.midX, y: primaryHeight - anchor.midY))
         }) ?? NSScreen.main
         if let vf = screen?.visibleFrame {
-            if origin.y < vf.minY { origin.y = primaryHeight - anchor.minY + 6 }   // flip above
+            if origin.y < vf.minY { origin.y = primaryHeight - anchor.minY + 4 }   // flip above
             origin.x = min(max(origin.x, vf.minX + 4), vf.maxX - size.width - 4)
         }
         panel.setFrame(NSRect(origin: origin, size: size), display: true)
@@ -75,14 +93,9 @@ final class SuggestionPanel {
     }
 }
 
-/// Bubble background: the whole bubble is one click target, highlighted on hover.
-private final class ClickableEffectView: NSVisualEffectView {
-    var onClick: () -> Void = {}
-    private var hovering = false { didSet { isEmphasized = hovering; material = hovering ? .selection : .popover } }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    // Labels inside shouldn't swallow the click.
-    override func hitTest(_ point: NSPoint) -> NSView? { frame.contains(point) ? self : nil }
+/// Card background: reports the pointer entering and leaving, so the card stays while it's hovered.
+private final class HoverEffectView: NSVisualEffectView {
+    var onHover: (Bool) -> Void = { _ in }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -90,13 +103,20 @@ private final class ClickableEffectView: NSVisualEffectView {
         addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
                                        owner: self))
     }
-    // set() rather than push/pop: the bubble can disappear under the pointer without a mouseExited.
-    override func mouseEntered(with event: NSEvent) { hovering = true; NSCursor.pointingHand.set() }
-    override func mouseExited(with event: NSEvent) { hovering = false; NSCursor.arrow.set() }
-    override func mouseDown(with event: NSEvent) {}
+    override func mouseEntered(with event: NSEvent) { onHover(true) }
+    override func mouseExited(with event: NSEvent) { onHover(false) }
+}
+
+/// A button that works on the first click in a panel that never becomes key.
+final class FirstMouseButton: NSButton {
+    var onPress: () -> Void = {}
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) {
+        highlight(true)
+    }
     override func mouseUp(with event: NSEvent) {
-        hovering = false
-        NSCursor.arrow.set()
-        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick() }
+        highlight(false)
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onPress() }
     }
 }
