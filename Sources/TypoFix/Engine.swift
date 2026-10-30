@@ -563,21 +563,27 @@ final class Engine {
         // The AX attempt may have left the typo selected already; (re)select it either way.
         _ = AX.setSelectedRange(el, s.map.toAX(s.range, in: original))
         waitFor("select typo", { selection(is: s.range, in: original) && value() == original }, tries: 5, then: {
-            // Last check before writing: the selection must hold exactly the typo.
-            guard Self.selectionCovers(s, el: el, text: original) else {
-                Log.write("accept: selection doesn't match the typo, not touching the text")
+            // Last check before writing: the selection must hold exactly the typo. Chromium-based apps
+            // (Claude, Chrome) report the new range before the selected text catches up, so give it a moment.
+            self.waitFor("selection holds the typo", { Self.selectionCovers(s, el: el, text: original) }, tries: 10, then: {
+                Log.write("accept: select + paste")
+                Keyboard.paste(s.right)
+                self.waitFor("paste fix", { value() == expected }) {
+                    _ = AX.setSelectedRange(el, CFRange(location: s.map.toAX(newCaret, in: expected), length: 0))
+                    // Caret not movable through AX after all: walk it back to where the user was typing.
+                    self.waitFor("restore caret", { selection(is: NSRange(location: newCaret, length: 0), in: expected) },
+                                 tries: 5, then: {}, otherwise: { Keyboard.arrowRight(tailCount) })
+                }
+            }, otherwise: {
+                let sel = AX.selectedRange(el).map { "\($0.location)+\($0.length)" } ?? "nil"
+                let want = s.map.toAX(s.range, in: original)
+                Log.write("accept: selection doesn't match the typo, not touching the text "
+                          + "(selection \(sel), want \(want.location)+\(want.length), "
+                          + "selected text 「\(AX.string(el, kAXSelectedTextAttribute) ?? "nil")」, "
+                          + "range text 「\(AX.selectedRange(el).flatMap { AX.stringForRange(el, $0) } ?? "nil")」)")
                 _ = AX.setSelectedRange(el, CFRange(location: s.map.toAX(s.caret, in: original), length: 0))
                 NSSound.beep()
-                return
-            }
-            Log.write("accept: select + paste")
-            Keyboard.paste(s.right)
-            self.waitFor("paste fix", { value() == expected }) {
-                _ = AX.setSelectedRange(el, CFRange(location: s.map.toAX(newCaret, in: expected), length: 0))
-                // Caret not movable through AX after all: walk it back to where the user was typing.
-                self.waitFor("restore caret", { selection(is: NSRange(location: newCaret, length: 0), in: expected) },
-                             tries: 5, then: {}, otherwise: { Keyboard.arrowRight(tailCount) })
-            }
+            })
         }, otherwise: {
             // Arrowing back only reaches typos before the caret.
             guard s.caret >= end else {
@@ -601,7 +607,8 @@ final class Engine {
     private static func selectionCovers(_ s: Suggestion, el: AXUIElement, text: String) -> Bool {
         guard let sel = AX.selectedRange(el) else { return false }
         if !s.wrong.isEmpty {
-            return AX.string(el, kAXSelectedTextAttribute) == s.wrong
+            // Selected text first; some apps leave it stale or empty, so also ask for the selected range's text.
+            return AX.string(el, kAXSelectedTextAttribute) == s.wrong || AX.stringForRange(el, sel) == s.wrong
         }
         // Insertion: nothing to read back in an empty selection; check the character before it instead.
         let ns = text as NSString

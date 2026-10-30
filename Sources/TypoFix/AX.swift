@@ -30,6 +30,13 @@ enum AX {
     }
 
     @discardableResult
+    /// The app's own text for a range (kAXStringForRangeParameterizedAttribute).
+    static func stringForRange(_ el: AXUIElement, _ r: CFRange) -> String? {
+        var range = r
+        guard let v = AXValueCreate(.cfRange, &range) else { return nil }
+        return parameterized(el, kAXStringForRangeParameterizedAttribute, v) as? String
+    }
+
     static func setSelectedRange(_ el: AXUIElement, _ r: CFRange) -> Bool {
         var r = r
         guard let v = AXValueCreate(.cfRange, &r) else { return false }
